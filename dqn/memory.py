@@ -1,5 +1,5 @@
 from collections import deque
-from random import choices
+from random import sample
 
 import numpy as np
 
@@ -14,7 +14,7 @@ class Memory(object):
 
     def sample(self, batch_size):
         assert(len(self.memory) >= batch_size)
-        choices(self.memory, k=batch_size)
+        return sample(self.memory, batch_size)
 
     def save(self, file):
         np.save(file, self.memory)
