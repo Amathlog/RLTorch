@@ -5,7 +5,7 @@ from rl.memory import Memory
 import numpy as np
 
 class Agent(object):
-    def __init__(self, env, model, policy, test_policy, batch_size=32, max_size_memory=100000):
+    def __init__(self, env, model, policy, test_policy, batch_size=32, max_size_memory=100000, action_repetition=1):
         self.env = env
         self.model = model
 
@@ -13,6 +13,8 @@ class Agent(object):
         self.batch_size = batch_size
         self.policy = policy
         self.test_policy = test_policy
+
+        self.action_repetition = action_repetition
 
         self.observation_shape = self.env.observation_space.shape
 
@@ -28,38 +30,50 @@ class Agent(object):
 
         return states, actions, rewards, next_states, dones
 
-    def step(self, observation, current_step, warm_up=0, train=True):
+    def step(self, observation, train=True):
         action = self.model.forward(np.array([observation], dtype=np.float32))
 
         action = self.policy(action) if train else self.test_policy(action)
 
-        next_observation, reward, done, info = self.env.step(action)
+        total_reward = 0
+        next_observation = np.zeros(self.observation_shape)
+        done = False
+        info = {}
+        steps = 0
+        for _ in range(self.action_repetition):
+            next_observation, reward, done, info = self.env.step(action)
+            total_reward += reward
+            steps += 1
+            if done:
+                break
+        reward = total_reward / steps
         next_observation = np.reshape(next_observation, self.observation_shape)
 
-        loss = 0
         if train:
-            self.memory.store([observation, action, reward, next_observation, 1 if done else 0])
-            if current_step >= warm_up:
-                loss = self.model.backward(*self.prepare_next_batch())
+            if hasattr(self.model, 'train'):
+                self.memory.store([observation, action, reward, next_observation, 0 if done else 1])
+            else:
+                self.memory.store([observation, action, reward, next_observation, 1 if done else 0])
 
-        return next_observation, reward, done, info, loss
+        return next_observation, reward, done, info
 
-    def fit(self, nb_episodes, warm_up=1000, verbose=True, episode_verbose=10):
+    def fit(self, nb_episodes, warm_up=1000, verbose=True, episode_verbose=10, test_render_period=None):
         self.policy.reset()
         nb_steps = 0
         mean_reward = 0
         mean_loss = 0
         for episode in range(1, nb_episodes + 1):
+            if test_render_period is not None and episode % test_render_period == 0:
+                self.test(3)
             current_reward = 0
             current_loss = 0
             current_steps = 0
             observation = self.env.reset()
             done = False
             while not done:
-                next_observation, reward, done, info, loss = self.step(observation, nb_steps, warm_up, True)
+                next_observation, reward, done, info = self.step(observation, True)
 
                 current_reward += reward
-                current_loss += loss
                 current_steps += 1
 
                 observation = next_observation
@@ -69,10 +83,18 @@ class Agent(object):
                 if done:
                     break
 
+            # Do the training only at the end of an episode
+            if nb_steps >= warm_up:
+                for _ in range(self.action_repetition * current_steps):
+                    if hasattr(self.model, 'train'):
+                        current_loss += self.model.backward(self.memory.sample(self.batch_size))[0]
+                    else:
+                        current_loss += self.model.backward(*self.prepare_next_batch())
+
             mean_reward += current_reward
             mean_loss += current_loss / current_steps
             if verbose and episode % episode_verbose == 0:
-                print(f'Episode {episode}: Mean reward->{mean_reward / episode_verbose}; '
+                print(f'[Train]Episode {episode}: Mean reward->{mean_reward / episode_verbose}; '
                       f'Mean Loss->{mean_loss / episode_verbose}')
                 mean_reward = 0
                 mean_loss = 0
@@ -88,7 +110,7 @@ class Agent(object):
                 self.env.render()
             done = False
             while not done:
-                next_observation, reward, done, info, _ = self.step(observation, nb_steps, train=False)
+                next_observation, reward, done, info = self.step(observation, train=False)
 
                 if render:
                     if record_frames:
@@ -106,19 +128,22 @@ class Agent(object):
                     break
 
             if verbose:
-                print(f'Episode {episode}: Reward->{current_reward}')
-
+                print(f'[Test]Episode {episode}: Reward->{current_reward}')
+        self.env.close()
         return frames
 
 if __name__ == "__main__":
     import sys
 
     import gym
+    import car_env
 
     from rl.dqn import MLP
-    from rl.policy import GreedyPolicy, AnnealingEpsilonGreedy, NormalNoiseContinuousPolicy
+    from rl.policy import GreedyPolicy, AnnealingEpsilonGreedy, OUNoiseContinuousPolicy, NormalNoiseContinuousPolicy
+    from DistributedRL.models.DDPG import DDPG as DDPG_Distrib
 
     ddpg = True
+    pendulum = False
 
     if not ddpg:
         env = gym.make('CartPole-v0')
@@ -127,23 +152,37 @@ if __name__ == "__main__":
         model = MLP([state_size, 32, 32, action_size])
         algo = DQN(env.observation_space.shape[0],
                        env.action_space.n,
-                       model, tau=1000)
+                       model, tau=1000, use_tensorboard=True)
         policy = AnnealingEpsilonGreedy(0.9, env.action_space, seed=0)
         test_policy = GreedyPolicy()
     else:
-        env = gym.make('Pendulum-v0')
+        if pendulum:
+            env = gym.make('Pendulum-v0')
+        else:
+            env = gym.make('CarRacingInternalState-v1')
         state_size = env.observation_space.shape[0]
         action_size = env.action_space.shape[0]
 
-        critic_model = MLP([state_size + action_size, 32, 32, 1])
-        actor_model = MLP([state_size, 32, 32, action_size], use_tanh=True)
-        algo = DDPG(state_size, action_size, critic_model, actor_model, action_support=(env.action_space.low, env.action_space.high))
-        policy = NormalNoiseContinuousPolicy(np.array([0.0]), np.array([0.1]), env.action_space)
+        critic_model = MLP([state_size + action_size, 64, 64, 32, 16, 1])
+        actor_model = MLP([state_size, 64, 64, 32, 16, action_size], use_tanh=True,
+                          output_support=(env.action_space.low, env.action_space.high))
+        algo = DDPG(state_size, action_size, critic_model, actor_model, use_tensorboard=True, gamma=0.9, tau=2500,
+                    learning_rate=(0.001, 0.0001))
+
+        # algo = DDPG_Distrib(1, state_size, action_size, True, "DDPG", update=2500, action_scaling=((-1.0,1.0), (0.0, 1.0), (0.0, 1.0)))
+        # algo.forward = algo.act
+        # algo.backward = algo.train
+        if pendulum:
+            policy = OUNoiseContinuousPolicy(np.array([0.0]), np.array([0.2]), np.array([0.15]), env.action_space)
+        else:
+            # policy = OUNoiseContinuousPolicy(np.array([0.0]*3), np.array([0.2]*3), np.array([0.15, 0.15, -0.1]), env.action_space)
+            policy = NormalNoiseContinuousPolicy(np.array([0.0, 0.0, 0.0]), np.array([0.2, 0.2, 0.2]), env.action_space)
         test_policy = GreedyPolicy()
 
-    agent = Agent(env, algo, policy, test_policy)
+    action_repetition = 3 if ddpg and not pendulum else 1
+    agent = Agent(env, algo, policy, test_policy, action_repetition=action_repetition)
 
-    agent.fit(20000, episode_verbose=100)
+    agent.fit(1000, episode_verbose=10, test_render_period=100)
 
     agent.test(10)
 

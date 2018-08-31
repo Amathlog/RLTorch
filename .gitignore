@@ -1,3 +1,6 @@
 .idea
 data
 *.pyc
+.ipynb_checkpoints/
+events.out.tfevents*
+*.png

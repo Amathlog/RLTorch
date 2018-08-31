@@ -2,21 +2,29 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from tensorboardX import SummaryWriter
 
 from copy import copy
+
 
 class MLP(nn.Module):
     """
     Create a MLP given layer sizes (input, hidden_layers, output)
     Use setattr and getattr because if we store layers in a list, PyTorch won't find them.
     """
-    def __init__(self, layers_sizes, use_tanh=False):
+    def __init__(self, layers_sizes, use_tanh=False, output_support=None):
         super().__init__()
 
         self.nb_layers = 0
+
         self.use_tanh = use_tanh
         for i in range(len(layers_sizes) - 1):
             self.add_layer(i, nn.Linear(layers_sizes[i], layers_sizes[i + 1]))
+
+        self.has_support = output_support is not None
+        if self.has_support:
+            self.min_support = torch.from_numpy(output_support[0])
+            self.max_support = torch.from_numpy(output_support[1])
 
     def add_layer(self, idx, layer):
         setattr(self, f'layer_{idx}', layer)
@@ -34,12 +42,15 @@ class MLP(nn.Module):
             x = F.relu(self.get_layer(i)(x))
         x = self.get_layer(-1)(x)
         if self.use_tanh:
-            return F.tanh(x)
+            x = F.tanh(x)
+        if self.has_support:
+            x = (self.max_support - self.min_support) * 0.5 * x + (self.max_support + self.min_support) * 0.5
         return x
 
 
 class DQN(object):
-    def __init__(self, state_size, action_size, model, learning_rate=1e-4, gamma=0.99, tau=2500):
+    def __init__(self, state_size, action_size, model, learning_rate=1e-4, gamma=0.95, tau=2500,
+                 use_tensorboard=False, summary_location='.'):
         self.state_size = state_size
         self.action_size = action_size
         self.learning_rate = learning_rate
@@ -50,6 +61,9 @@ class DQN(object):
         if self.tau >= 1:
             self.tau = int(self.tau)
         self.model = model
+
+        self.use_tensorboard = use_tensorboard
+        self.writer = SummaryWriter(log_dir=summary_location) if use_tensorboard else None
 
         self.global_step = 0
 
@@ -67,18 +81,25 @@ class DQN(object):
             states, actions, rewards, next_states, dones = \
                 map(torch.from_numpy, [states, actions, rewards, next_states, dones])
 
-        q_values = self.model(states).gather(1, actions.long().view(-1, 1)).view(-1)
+        all_q_values = self.model(states)
+        selected_q_values = all_q_values.gather(1, actions.long().view(-1, 1)).view(-1)
         # Bellman target
         next_q_values = torch.max(self.target_model(next_states), dim=-1)[0].detach()
         target = rewards + self.gamma * next_q_values * (1 - dones)
 
-        loss = self.criterion(q_values, target)
+        loss = self.criterion(selected_q_values, target)
 
         self.optimizer.zero_grad()
         loss.backward()
         for param in self.model.parameters():
             param.grad.data.clamp_(-1, 1)
         self.optimizer.step()
+
+        if self.use_tensorboard and self.global_step % 100 == 0:
+            for i in range(all_q_values.size()[1]):
+                self.writer.add_histogram(f"output_{i}", all_q_values.detach().numpy()[:, i], self.global_step)
+            self.writer.add_histogram(f"rewards", rewards.numpy(), self.global_step)
+            self.writer.add_scalar('critic_loss', loss.detach().numpy(), self.global_step)
 
         self.global_step += 1
 
@@ -101,3 +122,7 @@ class DQN(object):
             q_values = self.model(states)
             best_action = torch.argmax(q_values)
             return best_action.numpy()
+
+    def __del__(self):
+        if self.writer is not None:
+            self.writer.close()
