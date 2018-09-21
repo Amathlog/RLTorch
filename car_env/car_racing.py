@@ -1,4 +1,5 @@
 import math
+import time
 
 import Box2D
 import gym
@@ -63,14 +64,36 @@ BORDER_MIN_COUNT = 4
 
 ROAD_COLOR = [0.4, 0.4, 0.4]
 
+ACTIVATE_PROFILING = False
 
 def distance(x1, y1, x2, y2):
     return math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
 
-
 def projection(initial_point, point_to_project, vector_to_project_onto):
     return initial_point + np.dot(point_to_project - initial_point, vector_to_project_onto) * vector_to_project_onto
 
+def cross_2d(v_2d, v_3d):
+    return np.cross(np.concatenate([v_2d, [0]]), v_3d)[:2]
+
+class Profiling():
+    i = 0
+    def __init__(self, name=""):
+        self.name = name
+        self.id = Profiling.i
+        Profiling.i += 1
+
+    def __enter__(self):
+        self.time = time.perf_counter()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if ACTIVATE_PROFILING:
+            print(f'Block n_{self.id} ({self.name}): {(time.perf_counter() - self.time) * 1000:.2f}ms')
+
+def profile(func):
+    def wrapper(*args, **kwargs):
+        with Profiling(func.__name__):
+            return func(*args, **kwargs)
+    return wrapper
 
 class FrictionDetector(contactListener):
     def __init__(self, env):
@@ -145,12 +168,14 @@ class CarRacing(gym.Env):
         self.reward = 0.0
         self.prev_reward = 0.0
 
+        self.closest_points = (0, 1)
+
         self.use_internal_state = use_internal_state
         self.draw_debug = draw_debug
 
         self.action_space = spaces.Box(np.array([-1, 0, 0]), np.array([+1, +1, +1]))  # steer, gas, brake
         if self.use_internal_state:
-            self.observation_space = spaces.Box(low=-1, high=1, shape=(11,))
+            self.observation_space = spaces.Box(low=-1, high=1, shape=(15,))
         else:
             self.observation_space = spaces.Box(low=0, high=255, shape=(STATE_H, STATE_W, 3), dtype=np.uint8)
 
@@ -166,6 +191,7 @@ class CarRacing(gym.Env):
         self.road = []
         self.car.destroy()
 
+    @profile
     def _create_track(self):
         nb_checkpoints = 12
 
@@ -318,9 +344,10 @@ class CarRacing(gym.Env):
                 b2_r = (x2 + side * (TRACK_WIDTH + BORDER) * math.cos(beta2),
                         y2 + side * (TRACK_WIDTH + BORDER) * math.sin(beta2))
                 self.road_poly.append(([b1_l, b1_r, b2_r, b2_l], (1, 1, 1) if i % 2 == 0 else (1, 0, 0)))
-        self.track = track
+        self.track = np.array(track)
         return True
 
+    @profile
     def reset(self):
         self._destroy()
         self.reward = 0.0
@@ -331,6 +358,7 @@ class CarRacing(gym.Env):
         self.human_render = False
         self.out_of_the_road = False
         self.steps_without_moving = 0
+        self.closest_points = (0, 1)
 
         while True:
             success = self._create_track()
@@ -341,6 +369,7 @@ class CarRacing(gym.Env):
 
         return self.step(None)[0]
 
+    @profile
     def step(self, action):
         if action is not None:
             self.car.steer(-action[0])
@@ -350,6 +379,8 @@ class CarRacing(gym.Env):
         self.car.step(1.0 / FPS)
         self.world.Step(1.0 / FPS, 6 * 30, 2 * 30)
         self.t += 1.0 / FPS
+
+        self.update_closest_points()
 
         if self.use_internal_state:
             self.state = self.get_input()
@@ -366,14 +397,14 @@ class CarRacing(gym.Env):
             if not self.use_internal_state:
                 step_reward = self.reward - self.prev_reward
             else:
-                road_direction = np.concatenate((self.road_direction, [0]))
+                # road_direction = np.concatenate((self.road_direction, [0]))
                 # car_velocity = np.concatenate((self.car_velocity, [0]))
                 # up = np.array([0, 0, 1])
                 #
                 # # right vector is cross(road_direction, up) and velocity on right is dot(velocity, right)
                 # # so velocity_y = velocity . (road_direction x up) => Triple product => det(a,b,c)
                 #
-                step_reward = np.dot(self.car_velocity, road_direction[:2]) * (1 - 2 * np.abs(self.state[0])) / MAX_SPEED
+                step_reward = np.dot(self.car_velocity, self.road_direction) * (1 - 2 * np.abs(self.state[0])) / MAX_SPEED
                 #               - np.abs(np.linalg.det([car_velocity, road_direction, up])) \
 
             self.prev_reward = self.reward
@@ -388,6 +419,7 @@ class CarRacing(gym.Env):
 
         return self.state, step_reward, done, {}
 
+    @profile
     def render(self, mode='human'):
         if self.viewer is None:
             from gym.envs.classic_control import rendering
@@ -484,49 +516,57 @@ class CarRacing(gym.Env):
     @property
     def road_direction(self):
         index1, index2 = self.find_closest_point_and_next()
-        direction = np.array(self.track[index2][2:]) - np.array(self.track[index1][2:])
+        direction = self.track[index2][2:] - self.track[index1][2:]
         assert direction.any()
         return direction / np.linalg.norm(direction)
 
+    def update_closest_points(self):
+        point1 = self.track[self.closest_points[0] - 1][2:]
+        point2 = self.track[self.closest_points[0]][2:]
+        point3 = self.track[self.closest_points[1]][2:]
+        point4 = self.track[(self.closest_points[1] + 1) % len(self.track)][2:]
+
+        dist1 = np.linalg.norm(self.car_position - point1)
+        dist2 = np.linalg.norm(self.car_position - point2)
+        dist3 = np.linalg.norm(self.car_position - point3)
+        dist4 = np.linalg.norm(self.car_position - point4)
+
+        dists = [dist1, dist2, dist3, dist4]
+        min_dist = min(*dists)
+
+        if min_dist == dist1 or (min_dist == dist2 and dist1 < dist3):
+            # Go back
+            self.closest_points = (self.closest_points[0] - 1, self.closest_points[0])
+        elif min_dist == dist4 or (min_dist == dist3 and (dist4 < dist2)):
+            # Go further
+            self.closest_points = (self.closest_points[1], (self.closest_points[1] + 1) % len(self.track))
+
     def find_closest_point_and_next(self):
-        dist_min = -1
-        index = 0
-        for i, (alpha, beta, x, y) in enumerate(self.track):
-            dist = distance(x, y, *self.car_position)
-            if dist_min == -1 or dist < dist_min:
-                dist_min = dist
-                index = i
+        return self.closest_points
 
-        dist1 = np.linalg.norm(self.car_position - np.array(self.track[(index + 1) % len(self.track)][2:]))
-        dist2 = np.linalg.norm(self.car_position - np.array(self.track[index - 1][2:]))
-
-        if dist1 > dist2:
-            return index - 1, index
-
-        return index, (index + 1) % len(self.track)
-
-    def get_point_further_ahead(self, index, starting_point, ahead_distance):
+    def get_points_further_ahead(self, index, starting_point, ahead_distances):
         previous = starting_point
-        point = starting_point
         dist = 0
-        while dist < ahead_distance:
-            point = np.array(self.track[index][2:])
-            index = (index + 1) % len(self.track)
-            new_dist = dist + np.linalg.norm(point - previous)
-            if new_dist > ahead_distance:
-                # Do a linear interpolation
-                removing_dist = new_dist - ahead_distance
-                direction = (point - previous)
-                direction /= np.linalg.norm(direction)
-                point = point - removing_dist * direction
-            dist = new_dist
-            previous = point
-        return point
+        points = []
+        for ahead_distance in ahead_distances:
+            while dist < ahead_distance:
+                point = self.track[index][2:]
+                index = (index + 1) % len(self.track)
+                new_dist = dist + np.linalg.norm(point - previous)
+                if new_dist > ahead_distance:
+                    # Do a linear interpolation
+                    removing_dist = new_dist - ahead_distance
+                    direction = (point - previous)
+                    direction /= np.linalg.norm(direction)
+                    points.append(point - removing_dist * direction)
+                dist = new_dist
+                previous = point
+        return points
 
     def projection_on_road(self):
         index1, index2 = self.find_closest_point_and_next()
-        point1 = np.array(self.track[index1][2:])
-        point2 = np.array(self.track[index2][2:])
+        point1 = self.track[index1][2:]
+        point2 = self.track[index2][2:]
         direction = point2 - point1
         assert direction.any()
         direction /= np.linalg.norm(direction)
@@ -534,15 +574,16 @@ class CarRacing(gym.Env):
         position = self.car_position
         return projection(point1, position, direction), index2
 
-    def projection_further_ahead(self, index, starting_point, ahead_distance):
-        point_ahead = self.get_point_further_ahead(index, starting_point, ahead_distance)
+    def projections_further_ahead(self, index, starting_point, ahead_distances):
+        points_ahead = self.get_points_further_ahead(index, starting_point, ahead_distances)
         position = self.car_position
         direction = self.car_direction
 
-        proj = projection(position, point_ahead, direction)
+        projs = list(map(lambda p: projection(position, p, direction), points_ahead))
 
-        return proj, point_ahead
+        return projs, points_ahead
 
+    @profile
     def get_input(self):
         projection, index = self.projection_on_road()
 
@@ -551,11 +592,8 @@ class CarRacing(gym.Env):
         road_direction = self.road_direction
         angle = np.arccos(np.dot(self.car_direction, road_direction))
 
-        road_direction = np.concatenate((road_direction, [0.0]))
         top = np.array([0, 0, 1])
-        left = np.cross(road_direction, top)[:2]
-
-        road_direction = road_direction[:2]
+        left = cross_2d(road_direction, top)
 
         velocity_x = np.dot(velocity, road_direction)
         velocity_y = np.dot(velocity, left)
@@ -573,22 +611,18 @@ class CarRacing(gym.Env):
 
         res = [distance_from_road, angle, velocity_x, velocity_y, drift_angle]
 
-        for i in (5, 20, 35):
-            proj, point_ahead = self.projection_further_ahead(index, projection, i)
-            v_vector = proj - self.car_position
-            h_vector = point_ahead - proj
-            v = np.linalg.norm(v_vector)
-            h = np.linalg.norm(h_vector)
+        distances = np.array((5, 20, 35))
+        projs, points_ahead = self.projections_further_ahead(index, projection, distances)
+        projs = np.array(projs)
+        points_ahead = np.array(points_ahead)
 
-            # Comptue the right sign
-            if v != 0:
-                v_vector /= v
-                v *= np.sign(np.dot(self.car_direction, v_vector)) / i # Divide by i for normalization
-            if h != 0:
-                h_vector /= h
-                h *= np.sign(np.cross(self.car_direction, h_vector)) / i # Divide by i for normalization
+        v_vectors = projs - self.car_position
+        h_vectors = points_ahead - projs
+        v = np.linalg.norm(v_vectors, axis=1) * np.sign(np.dot(v_vectors, self.car_direction)) / distances
+        h = np.linalg.norm(h_vectors, axis=1) * np.sign(np.cross(h_vectors, self.car_direction)) / distances
+        res += list(v) + list(h)
 
-            res.extend([v, h])
+        res.extend([w.omega / 360.0 for w in self.car.wheels])
 
         self.out_of_the_road = abs(distance_from_road) > 1
 
@@ -636,24 +670,24 @@ class CarRacing(gym.Env):
         gl.glVertex3f(*self.car_position, 0)
         gl.glVertex3f(*(self.car_position + self.car_velocity), 0)
         gl.glColor4f(1, 0, 1, 1)
-        proj1, point_ahead1 = self.projection_further_ahead(index, proj, 5)
-        proj2, point_ahead2 = self.projection_further_ahead(index, proj, 20)
-        proj3, point_ahead3 = self.projection_further_ahead(index, proj, 35)
+        distances = [5, 20, 35]
+        projs, points_ahead = self.projections_further_ahead(index, proj, distances)
         gl.glVertex3f(*self.car_position, 0)
-        gl.glVertex3f(*proj3, 0)
-        gl.glVertex3f(*proj1, 0)
-        gl.glVertex3f(*point_ahead1, 0)
-        gl.glVertex3f(*proj2, 0)
-        gl.glVertex3f(*point_ahead2, 0)
-        gl.glVertex3f(*proj3, 0)
-        gl.glVertex3f(*point_ahead3, 0)
+        gl.glVertex3f(*projs[2], 0)
+        for proj_, point_ahead in zip(projs, points_ahead):
+            gl.glVertex3f(*proj_, 0)
+            gl.glVertex3f(*point_ahead, 0)
         gl.glEnd()
 
     def display_input_debug(self):
         text = ['Distance', 'Angle', 'Velocity x', 'Velocity y', 'Drift Angle',
-                '5 meter v', '5 meter h',
-                '20 meter v', '20 meter h',
-                '35 meter v', '35 meter h']
+                '5 meter v',
+                '20 meter v',
+                '35 meter v',
+                '5 meter h',
+                '20 meter h',
+                '35 meter h',
+                'omega_1', 'omega_2', 'omega_3', 'omega_4']
 
         if self.state is None or len(self.state) != len(text):
             input_ = self.get_input()

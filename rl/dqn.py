@@ -47,6 +47,13 @@ class MLP(nn.Module):
             x = (self.max_support - self.min_support) * 0.5 * x + (self.max_support + self.min_support) * 0.5
         return x
 
+    def save(self, file):
+        torch.save(self.state_dict(), str(file))
+
+    def load(self, file):
+        self.load_state_dict(torch.load(str(file)))
+        self.eval()
+
 
 class DQN(object):
     def __init__(self, state_size, action_size, model, learning_rate=1e-4, gamma=0.95, tau=2500,
@@ -68,8 +75,7 @@ class DQN(object):
         self.global_step = 0
 
         self.target_model = copy(self.model)
-        self.target_model.load_state_dict(self.model.state_dict())
-        self.target_model.eval()
+        self.reset_target()
 
         self.criterion = nn.MSELoss()
         self.optimizer = optim.SGD(list(self.model.parameters()), lr=self.learning_rate, momentum=0.9)
@@ -122,6 +128,19 @@ class DQN(object):
             q_values = self.model(states)
             best_action = torch.argmax(q_values)
             return best_action.numpy()
+
+    def reset_target(self):
+        self.target_model.load_state_dict(self.model.state_dict())
+        self.target_model.eval()
+
+    def save(self, file):
+        self.model.save(file)
+
+    def load(self, file, reset_target=True):
+        self.model.load(file)
+
+        if reset_target:
+            self.reset_target()
 
     def __del__(self):
         if self.writer is not None:

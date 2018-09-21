@@ -1,11 +1,15 @@
+import datetime
+from pathlib import Path
+
+import numpy as np
+
 from rl.dqn import DQN
 from rl.ddpg import DDPG
 from rl.memory import Memory
 
-import numpy as np
-
 class Agent(object):
-    def __init__(self, env, model, policy, test_policy, batch_size=32, max_size_memory=100000, action_repetition=1):
+    def __init__(self, env, model, policy, test_policy, batch_size=32, max_size_memory=100000, action_repetition=1,
+                 save_folder=None):
         self.env = env
         self.model = model
 
@@ -18,6 +22,9 @@ class Agent(object):
 
         self.observation_shape = self.env.observation_space.shape
 
+        self.best_reward = None
+        self.reward_improved = False
+        self.save_folder = save_folder
 
     def prepare_next_batch(self):
         batch = self.memory.sample(self.batch_size)
@@ -57,14 +64,24 @@ class Agent(object):
 
         return next_observation, reward, done, info
 
-    def fit(self, nb_episodes, warm_up=1000, verbose=True, episode_verbose=10, test_render_period=None):
+    def fit(self, nb_episodes, warm_up=1000, verbose=True, episode_verbose=10, test_period=None, render_test=False):
         self.policy.reset()
         nb_steps = 0
         mean_reward = 0
         mean_loss = 0
         for episode in range(1, nb_episodes + 1):
-            if test_render_period is not None and episode % test_render_period == 0:
-                self.test(3)
+            if test_period is not None and episode % test_period == 0:
+                self.test(3, render=render_test)
+                if self.reward_improved:
+                    if verbose:
+                        print(f'Reward has improved: {self.best_reward}')
+                    if self.save_folder is not None:
+                        file = self.save_folder / (datetime.datetime.now().strftime("%Y_%m_%d_%H_%M") +
+                               f'_R={self.best_reward:.1f}.model')
+                        if verbose:
+                            print(f'Saving the model: {str(file)}')
+                        self.model.save(file)
+
             current_reward = 0
             current_loss = 0
             current_steps = 0
@@ -103,6 +120,7 @@ class Agent(object):
         self.test_policy.reset()
         nb_steps = 0
         frames = []
+        full_reward = 0
         for episode in range(1, nb_episodes + 1):
             current_reward = 0
             observation = self.env.reset()
@@ -129,7 +147,17 @@ class Agent(object):
 
             if verbose:
                 print(f'[Test]Episode {episode}: Reward->{current_reward}')
+            full_reward += current_reward
+        full_reward /= nb_episodes
+        if self.best_reward is None or full_reward >= self.best_reward:
+            self.best_reward = full_reward
+            self.reward_improved = True
+        else:
+            self.reward_improved = False
+
         self.env.close()
+        if self.env.env.viewer is not None:
+            self.env.env.viewer = None
         return frames
 
 if __name__ == "__main__":
@@ -144,6 +172,10 @@ if __name__ == "__main__":
 
     ddpg = True
     pendulum = False
+    train = False
+
+    # model_to_load = None
+    model_to_load = Path(r'C:\Users\alogut\Documents\Programming\RLTorch\rl\savedata\CarRacing') / '2018_09_14_12_42_R=149.5.model'
 
     if not ddpg:
         env = gym.make('CartPole-v0')
@@ -155,16 +187,19 @@ if __name__ == "__main__":
                        model, tau=1000, use_tensorboard=True)
         policy = AnnealingEpsilonGreedy(0.9, env.action_space, seed=0)
         test_policy = GreedyPolicy()
+        env_name = 'CartPole'
     else:
         if pendulum:
             env = gym.make('Pendulum-v0')
+            env_name = 'Pendulum'
         else:
             env = gym.make('CarRacingInternalState-v1')
+            env_name = 'CarRacing'
         state_size = env.observation_space.shape[0]
         action_size = env.action_space.shape[0]
 
-        critic_model = MLP([state_size + action_size, 64, 64, 32, 16, 1])
-        actor_model = MLP([state_size, 64, 64, 32, 16, action_size], use_tanh=True,
+        critic_model = MLP([state_size + action_size, 256, 128, 64, 1])
+        actor_model = MLP([state_size, 256, 128, 64, action_size], use_tanh=True,
                           output_support=(env.action_space.low, env.action_space.high))
         algo = DDPG(state_size, action_size, critic_model, actor_model, use_tensorboard=True, gamma=0.9, tau=2500,
                     learning_rate=(0.001, 0.0001))
@@ -180,9 +215,15 @@ if __name__ == "__main__":
         test_policy = GreedyPolicy()
 
     action_repetition = 3 if ddpg and not pendulum else 1
-    agent = Agent(env, algo, policy, test_policy, action_repetition=action_repetition)
+    if model_to_load is not None:
+        algo.load(model_to_load, reset_target=True)
+    save_folder = Path('savedata') / f'{env_name}'
+    if not save_folder.exists():
+        save_folder.mkdir(parents=True, exist_ok=True)
+    agent = Agent(env, algo, policy, test_policy, action_repetition=action_repetition, save_folder=save_folder)
 
-    agent.fit(1000, episode_verbose=10, test_render_period=100)
+    if train:
+        agent.fit(5000, episode_verbose=10, test_period=100, render_test=False)
 
     agent.test(10)
 

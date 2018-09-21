@@ -6,6 +6,16 @@ import torch.nn as nn
 import torch.optim as optim
 from tensorboardX import SummaryWriter
 
+def format_file(file):
+    parent = file.parent
+    name = file.stem
+    suffix = file.suffix
+
+    critic_name = name + '_critic' + suffix
+    actor_name = name + '_actor' + suffix
+
+    return parent / critic_name, parent / actor_name
+
 
 class DDPG(object):
     def __init__(self, state_size, action_size, critic_model, actor_model, learning_rate=(1e-5, 1e-4), gamma=0.95,
@@ -28,12 +38,9 @@ class DDPG(object):
         self.global_step = 0
 
         self.target_critic_model = copy(self.critic_model)
-        self.target_critic_model.load_state_dict(self.critic_model.state_dict())
-        self.target_critic_model.eval()
-
         self.target_actor_model = copy(self.actor_model)
-        self.target_actor_model.load_state_dict(self.actor_model.state_dict())
-        self.target_actor_model.eval()
+
+        self.reset_targets()
 
         self.criterion = nn.MSELoss()
         self.critic_optimizer = optim.Adam(list(self.critic_model.parameters()), lr=self.learning_rate[0])
@@ -106,3 +113,23 @@ class DDPG(object):
                 return action.reshape((self.action_size, ))
 
             return action.reshape((states.shape[0], self.action_size))
+
+    def reset_targets(self):
+        self.target_critic_model.load_state_dict(self.critic_model.state_dict())
+        self.target_critic_model.eval()
+
+        self.target_actor_model.load_state_dict(self.actor_model.state_dict())
+        self.target_actor_model.eval()
+
+    def save(self, file):
+        critic_file, actor_file = format_file(file)
+        self.critic_model.save(critic_file)
+        self.actor_model.save(actor_file)
+
+    def load(self, file, reset_target=True):
+        critic_file, actor_file = format_file(file)
+        self.actor_model.load(actor_file)
+        self.critic_model.load(critic_file)
+
+        if reset_target:
+            self.reset_targets()
