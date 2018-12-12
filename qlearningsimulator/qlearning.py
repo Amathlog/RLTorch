@@ -64,6 +64,7 @@ class Grid(object):
 
     def reset(self):
         self.current_pos = np.array(self.start)
+        self.previous_pos = np.array(self.current_pos)
 
     def step(self, action):
         """
@@ -78,6 +79,7 @@ class Grid(object):
             self.data[tuple(next_pos)] == 'X':
             return self.action_reward, False
 
+        self.previous_pos = np.array(self.current_pos)
         self.current_pos = next_pos
         # Check if we arrived at a terminal state
         if self.data[tuple(self.current_pos)] != '.':
